@@ -64,6 +64,41 @@ class StepOutcome:
     update: Literal["applied", "amp_skip", "ascent_skip"]
 
 
+@dataclass(frozen=True)
+class Teacher:
+    model: nn.Module
+    mean: torch.Tensor
+    std: torch.Tensor
+
+
+@dataclass(frozen=True)
+class Distillation:
+    """Hinton et al. (https://arxiv.org/abs/1503.02531) with an averaged teacher ensemble."""
+
+    teachers: tuple[Teacher, ...]
+    alpha: float
+    temperature: float
+
+    def targets(self, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor, amp: bool) -> torch.Tensor:
+        # The student batch is normalized with the student's statistics; each
+        # teacher sees the identical augmented pixels under its own statistics.
+        pixels = x * std[None, :, None, None] + mean[None, :, None, None]
+        total = None
+        with torch.no_grad():
+            for teacher in self.teachers:
+                with torch.autocast(device_type=x.device.type, enabled=amp):
+                    logits = teacher.model((pixels - teacher.mean[None, :, None, None]) / teacher.std[None, :, None, None])
+                probabilities = F.softmax(logits.float() / self.temperature, dim=1)
+                total = probabilities if total is None else total + probabilities
+        return total / len(self.teachers)
+
+    def loss(self, hard_loss: torch.Tensor, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type=logits.device.type, enabled=False):
+            log_student = F.log_softmax(logits.float() / self.temperature, dim=1)
+            divergence = (targets * (targets.clamp_min(1e-8).log() - log_student)).sum(dim=1).mean()
+            return (1 - self.alpha) * hard_loss.float() + self.alpha * self.temperature ** 2 * divergence
+
+
 def normalize(x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
     return (x.float().div_(255) - mean[None, :, None, None]) / std[None, :, None, None]
 
@@ -254,13 +289,18 @@ def method_record(policy: Policy, optimizer_kind: OptimizerKind) -> dict:
 
 
 class TrainingMethod:
-    def __init__(self, policy: Policy, optimizer_kind: OptimizerKind, *, model: nn.Module, optimizer: torch.optim.Optimizer, mean: torch.Tensor, std: torch.Tensor, rngs: Rngs, amp: bool, deadline: float | None = None):
+    def __init__(self, policy: Policy, optimizer_kind: OptimizerKind, *, model: nn.Module, optimizer: torch.optim.Optimizer, mean: torch.Tensor, std: torch.Tensor, rngs: Rngs, amp: bool, deadline: float | None = None, distillation: Distillation | None = None):
         if policy not in POLICIES or optimizer_kind not in OPTIMIZERS or (optimizer_kind == "sam" and policy in {"augmix_jsd", "cutmix"}):
             raise ValueError("unsupported training method")
+        if distillation is not None and (optimizer_kind != "sgd" or policy == "augmix_jsd" or not distillation.teachers):
+            raise ValueError("distillation requires SGD, a single-view policy, and at least one teacher")
         self.policy, self.optimizer_kind = policy, optimizer_kind
         self.model, self.optimizer = model, optimizer
         self.mean, self.std, self.rngs = mean, std, rngs
         self.amp, self.deadline = amp, deadline
+        self.distillation = distillation
+        for teacher in distillation.teachers if distillation is not None else ():
+            teacher.model.eval()
         device_type = mean.device.type
         self.descent_scaler = torch.amp.GradScaler(device_type, enabled=amp)
         self.ascent_scaler = torch.amp.GradScaler(device_type, enabled=amp) if optimizer_kind == "sam" else None
@@ -270,8 +310,12 @@ class TrainingMethod:
             raise TimeoutError("deadline expired during training method")
 
     def _forward(self, batch: TrainBatch) -> tuple[torch.Tensor, torch.Tensor]:
+        targets = self.distillation.targets(batch.x, self.mean, self.std, self.amp) if self.distillation is not None else None
         with torch.autocast(device_type=batch.x.device.type, enabled=self.amp):
-            loss, correct = objective(batch, self.model(batch.x))
+            logits = self.model(batch.x)
+            loss, correct = objective(batch, logits)
+        if targets is not None:
+            loss = self.distillation.loss(loss, logits, targets)
         if not math.isfinite(loss.item()):
             raise ValueError("non-finite training loss")
         return loss, correct

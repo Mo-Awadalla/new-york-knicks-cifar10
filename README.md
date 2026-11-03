@@ -139,6 +139,20 @@ The comparator verifies checkpoint-bound configuration and provenance, the canon
 
 AugMix adapts the [authors' training and operations](https://github.com/google-research/augmix), retaining Apache attribution. SAM follows the [paper](https://arxiv.org/abs/2010.01412) with exact perturbed-weight and BatchNorm-buffer rollback. CutMix follows the [authors' patch and label-area method](https://github.com/clovaai/CutMix-PyTorch), retaining MIT attribution.
 
+## Distill the teacher ensemble
+
+`configs/kd-cutmix22-val.json` and `configs/kd-cutmix22-full.json` train one WRN-22-4 CutMix student against the averaged temperature-4 predictions of three from-scratch teachers: SAM-Cutout WRN-22-4, CutMix WRN-22-4, and Cutout WRN-16-4. The loss is 0.9 times the scaled KL divergence plus 0.1 times the CutMix loss ([Hinton et al.](https://arxiv.org/abs/1503.02531)). Teachers see the student's augmented pixels under their own normalization statistics. Only the student is submitted; its 4,298,970 parameters satisfy the cap. The course rules permit distillation from teachers trained from scratch on permitted data.
+
+Each config pins teacher checkpoint names and SHA-256 hashes. The validation config uses teachers trained on the 45,000 training rows only, and the loader rejects any teacher that saw validation rows. The full-data config uses the full-data teachers. Majority voting of the 45,000-row teachers reached 4,864 of 5,000 validation images, against 4,846 for the best single teacher.
+
+Teacher checkpoints are uploaded as the private Kaggle dataset `moawadalla/knicks-kd-teachers-001` and found under `/kaggle/input` at run time. Pass `--teachers DIR` to search a local directory instead.
+
+```bash
+uv run python src/knicks_cifar.py stage --config configs/kd-cutmix22-full.json \
+  --run-id kd-cutmix22-full-001 --out runs/kd-cutmix22-full-001/kernel \
+  --teachers-dataset moawadalla/knicks-kd-teachers-001
+```
+
 
 ## Project folders
 

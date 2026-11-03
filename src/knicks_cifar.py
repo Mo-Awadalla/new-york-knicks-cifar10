@@ -25,7 +25,7 @@ from torch.optim.swa_utils import AveragedModel, update_bn
 from torch.torch_version import TorchVersion
 
 import knicks_methods
-from knicks_methods import OPTIMIZERS, POLICIES, Rngs, TrainingMethod, augment, method_record, normalize
+from knicks_methods import OPTIMIZERS, POLICIES, Distillation, Rngs, Teacher, TrainingMethod, augment, method_record, normalize
 
 
 ARCHS = {"wrn16_4": (16, 2_748_890), "wrn22_4": (22, 4_298_970)}
@@ -63,6 +63,12 @@ class RunConfig:
     warmup: int = 5
     strategy: Literal["cosine", "swa"] = "cosine"
     optimizer: Literal["sgd", "sam"] = "sgd"
+    teachers: tuple[tuple[str, str], ...] = ()
+    kd_alpha: float = 0.9
+    kd_temperature: float = 4.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "teachers", tuple(tuple(item) for item in self.teachers))
 
     def validate(self) -> None:
         if self.arch not in ARCHS or self.aug not in POLICIES:
@@ -79,6 +85,17 @@ class RunConfig:
             raise ValueError("invalid optimization configuration")
         if not all(math.isfinite(x) for x in (self.lr, self.momentum, self.wd)):
             raise ValueError("optimizer values must be finite")
+        if self.teachers:
+            if self.optimizer != "sgd" or self.strategy != "cosine" or self.aug == "augmix_jsd":
+                raise ValueError("distillation requires SGD, the cosine schedule, and a single-view augmentation")
+            if not all(math.isfinite(x) for x in (self.kd_alpha, self.kd_temperature)) or not 0 < self.kd_alpha <= 1 or self.kd_temperature <= 0:
+                raise ValueError("invalid distillation weight or temperature")
+            if any(len(item) != 2 or not re.fullmatch(r"[A-Za-z0-9._-]+\.pt", item[0]) or not re.fullmatch(r"[0-9a-f]{64}", item[1]) for item in self.teachers):
+                raise ValueError("teachers must be [checkpoint file name, sha256] pairs")
+            if len({name for name, _ in self.teachers}) != len(self.teachers):
+                raise ValueError("teacher file names must be unique")
+        elif (self.kd_alpha, self.kd_temperature) != (0.9, 4.0):
+            raise ValueError("distillation settings require teachers")
 
 
 def sha256_file(path: Path) -> str:
@@ -316,6 +333,36 @@ def checkpoint_model(path: Path, device: torch.device) -> tuple[dict, nn.Module,
     return checkpoint, model, torch.tensor(checkpoint["mean"], device=device), torch.tensor(checkpoint["std"], device=device)
 
 
+def load_distillation(cfg: RunConfig, split_sha256: str, teacher_dir: Path | None, device: torch.device) -> tuple[Distillation | None, list[dict]]:
+    if not cfg.teachers:
+        return None, []
+    search = teacher_dir.resolve() if teacher_dir is not None else Path("/kaggle/input")
+    teachers, records = [], []
+    for name, expected in cfg.teachers:
+        matches = sorted(search.rglob(name))
+        if len(matches) != 1:
+            raise ValueError(f"expected one teacher {name} under {search}, found {len(matches)}")
+        if sha256_file(matches[0]) != expected:
+            raise ValueError(f"teacher {name} sha256 mismatch")
+        checkpoint, model, mean, std = checkpoint_model(matches[0], device)
+        teacher_cfg = checkpoint["config"]
+        if checkpoint["completed_epochs"] != teacher_cfg["epochs"]:
+            raise ValueError(f"teacher {name} did not complete its configured epochs")
+        # A teacher that saw validation rows would leak their labels into the student.
+        if cfg.split == "val" and (teacher_cfg["split"] != "val" or checkpoint["split_sha256"] != split_sha256):
+            raise ValueError(f"teacher {name} was not trained on the student's training rows only")
+        model.requires_grad_(False)
+        teachers.append(Teacher(model, mean, std))
+        records.append({"file": name, "sha256": expected, "arch": teacher_cfg["arch"], "aug": teacher_cfg["aug"], "optimizer": teacher_cfg.get("optimizer", "sgd"), "split": teacher_cfg["split"], "epochs": teacher_cfg["epochs"], "params": checkpoint["params"]})
+    return Distillation(tuple(teachers), cfg.kd_alpha, cfg.kd_temperature), records
+
+
+def distillation_record(cfg: RunConfig, records: list[dict], train_loss_meaning: str) -> dict:
+    if not records:
+        return {}
+    return {"distillation_teachers": records, "kd_alpha": cfg.kd_alpha, "kd_temperature": cfg.kd_temperature, "train_loss_meaning": f"kd_weighted_{train_loss_meaning}"}
+
+
 def evaluate(model: nn.Module, images: torch.Tensor, labels: torch.Tensor | None, rows: tuple[int, ...], mean: torch.Tensor, std: torch.Tensor, batch: int, deadline: float | None = None) -> tuple[list[int], float | None, int | None]:
     predictions = []
     total_loss = 0.0
@@ -435,7 +482,7 @@ def configure_training_determinism(cfg: RunConfig, device: torch.device) -> None
         torch.use_deterministic_algorithms(cfg.aug != "randaugment_cutout")
 
 
-def train(cfg: RunConfig, root: Path, out: Path, device: torch.device, max_seconds: float, kind: str = "train") -> None:
+def train(cfg: RunConfig, root: Path, out: Path, device: torch.device, max_seconds: float, kind: str = "train", teacher_dir: Path | None = None) -> None:
     cfg.validate()
     if not math.isfinite(max_seconds) or max_seconds <= 0:
         raise ValueError("max-seconds must be finite and positive")
@@ -465,6 +512,10 @@ def train(cfg: RunConfig, root: Path, out: Path, device: torch.device, max_secon
         labels = torch.tensor(manifest.labels, dtype=torch.long, device=device)
         configure_training_determinism(cfg, device)
         status["deterministic_algorithms"] = torch.are_deterministic_algorithms_enabled()
+        # Teachers are built before seeding so the student's initialization stream is unchanged.
+        distillation, teacher_records = load_distillation(cfg, split.sha256, teacher_dir, device)
+        info.update(distillation_record(cfg, teacher_records, info["train_loss_meaning"]))
+        status.update(info)
         random.seed(cfg.seed)
         np.random.seed(cfg.seed)
         torch.manual_seed(cfg.seed)
@@ -476,7 +527,7 @@ def train(cfg: RunConfig, root: Path, out: Path, device: torch.device, max_secon
         optimizer = torch.optim.SGD(model.parameters(), lr=cfg.lr, momentum=cfg.momentum, weight_decay=cfg.wd, nesterov=True)
         order_rng = torch.Generator().manual_seed(stream_seed(cfg, 1))
         rngs = Rngs(crop=torch.Generator().manual_seed(stream_seed(cfg, 2)), cutout=torch.Generator().manual_seed(stream_seed(cfg, 3)), method=np.random.default_rng(stream_seed(cfg, 6)))
-        method = TrainingMethod(cfg.aug, cfg.optimizer, model=model, optimizer=optimizer, mean=mean, std=std, rngs=rngs, amp=device.type == "cuda", deadline=deadline)
+        method = TrainingMethod(cfg.aug, cfg.optimizer, model=model, optimizer=optimizer, mean=mean, std=std, rngs=rngs, amp=device.type == "cuda", deadline=deadline, distillation=distillation)
         rows = torch.tensor(split.train_rows, dtype=torch.long, device=device)
         steps_per_epoch = math.ceil(len(rows) / cfg.batch)
         step = 0
@@ -606,7 +657,7 @@ def predict(checkpoint_path: Path, root: Path, out: Path, device: torch.device) 
     check_submission(out, root / "sample_submission.csv")
 
 
-def smoke(root: Path, out: Path, device: torch.device, cfg: RunConfig) -> None:
+def smoke(root: Path, out: Path, device: torch.device, cfg: RunConfig, teacher_dir: Path | None = None) -> None:
     cfg.validate()
     out.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
@@ -625,6 +676,7 @@ def smoke(root: Path, out: Path, device: torch.device, cfg: RunConfig) -> None:
         test_images = decode(test_manifest, test_rows, index, device)
         mean, std = channel_stats(images, tuple(range(len(train_rows))))
         labels = torch.tensor([train_manifest.labels[i] for i in train_rows], device=device)
+        distillation, teacher_records = load_distillation(cfg, stratified_split(train_manifest, cfg.split).sha256, teacher_dir, device)
         torch.manual_seed(cfg.seed)
         model = build(cfg.arch).to(device)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
@@ -643,7 +695,7 @@ def smoke(root: Path, out: Path, device: torch.device, cfg: RunConfig) -> None:
             raise ValueError(f"smoke overfit did not reduce training loss: {initial_loss} -> {final_loss}")
         method_optimizer = torch.optim.SGD(model.parameters(), lr=cfg.lr, momentum=cfg.momentum, weight_decay=cfg.wd, nesterov=True)
         rngs = Rngs(crop=torch.Generator().manual_seed(stream_seed(cfg, 2)), cutout=torch.Generator().manual_seed(stream_seed(cfg, 3)), method=np.random.default_rng(stream_seed(cfg, 6)))
-        method = TrainingMethod(cfg.aug, cfg.optimizer, model=model, optimizer=method_optimizer, mean=mean, std=std, rngs=rngs, amp=device.type == "cuda")
+        method = TrainingMethod(cfg.aug, cfg.optimizer, model=model, optimizer=method_optimizer, mean=mean, std=std, rngs=rngs, amp=device.type == "cuda", distillation=distillation)
         outcome = method.step(images, labels)
         model.eval()
         with torch.inference_mode():
@@ -651,6 +703,7 @@ def smoke(root: Path, out: Path, device: torch.device, cfg: RunConfig) -> None:
         split = stratified_split(train_manifest, "val")
         info = provenance(root, device)
         info.update(method_record(cfg.aug, cfg.optimizer))
+        info.update(distillation_record(cfg, teacher_records, info["train_loss_meaning"]))
         json_write(out / "config.json", asdict(cfg))
         write_split(out / "split.json", split, train_manifest)
         checkpoint_path = out / "checkpoint.pt"
@@ -675,7 +728,7 @@ def smoke(root: Path, out: Path, device: torch.device, cfg: RunConfig) -> None:
         json_write(out / "manifest.json", status)
 
 
-def stage(config_path: Path, run_id: str, out: Path, mode: str, seed: int | None = None) -> None:
+def stage(config_path: Path, run_id: str, out: Path, mode: str, seed: int | None = None, teachers_dataset: str | None = None) -> None:
     cfg = config_from(config_path)
     if seed is not None:
         cfg = replace(cfg, seed=seed)
@@ -686,6 +739,8 @@ def stage(config_path: Path, run_id: str, out: Path, mode: str, seed: int | None
         raise ValueError("comparison staging requires the validation split")
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", run_id) or len(run_id) > 42:
         raise ValueError("run-id must be lowercase alphanumeric words separated by hyphens, at most 42 characters")
+    if bool(cfg.teachers) != (teachers_dataset is not None) or (teachers_dataset is not None and not re.fullmatch(r"[a-z0-9-]+/[a-z0-9-]+", teachers_dataset)):
+        raise ValueError("distillation configs require exactly one owner/slug teacher dataset; other configs take none")
     out.mkdir(parents=True, exist_ok=False)
     slug = f"knicks-{run_id}"
     source_hashes()
@@ -708,7 +763,7 @@ def stage(config_path: Path, run_id: str, out: Path, mode: str, seed: int | None
         "    knicks_cifar.run_kernel(SPEC, sys.argv[1:])\n"
     )
     (out / "kernel.py").write_text(staged)
-    json_write(out / "kernel-metadata.json", {"id": f"moawadalla/{slug}", "title": slug, "code_file": "kernel.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": False, "dataset_sources": [], "competition_sources": ["cifar-10-res-net-architecture-challenge-dl"], "kernel_sources": []})
+    json_write(out / "kernel-metadata.json", {"id": f"moawadalla/{slug}", "title": slug, "code_file": "kernel.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": False, "dataset_sources": [teachers_dataset] if teachers_dataset else [], "competition_sources": ["cifar-10-res-net-architecture-challenge-dl"], "kernel_sources": []})
 
 
 def run_kernel(spec: dict, argv: list[str]) -> None:
@@ -716,6 +771,7 @@ def run_kernel(spec: dict, argv: list[str]) -> None:
     parser.add_argument("--working", type=Path, default=Path("/kaggle/working"))
     parser.add_argument("--data", type=Path)
     parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default="cuda")
+    parser.add_argument("--teachers", type=Path, help="directory searched for teacher checkpoints; defaults to /kaggle/input")
     args = parser.parse_args(argv)
     if source_sha256() != spec["source_sha256"]:
         raise RuntimeError("staged source hash mismatch")
@@ -729,6 +785,8 @@ def run_kernel(spec: dict, argv: list[str]) -> None:
     command = ["smoke" if mode == "smoke" else "train", "--config", str(config_path), "--out", str(output_path), "--device", args.device]
     if args.data is not None:
         command += ["--data", str(args.data)]
+    if args.teachers is not None:
+        command += ["--teachers", str(args.teachers)]
     if mode == "calibrate":
         command += ["--epochs", "3", "--calibrate"]
     elif mode == "compare":
@@ -752,12 +810,14 @@ def main(argv: list[str] | None = None) -> None:
     train_parser.add_argument("--epochs", type=int)
     train_parser.add_argument("--split", choices=("val", "all"))
     train_parser.add_argument("--max-seconds", type=float, default=DEFAULT_DEADLINE)
+    train_parser.add_argument("--teachers", type=Path, help="directory searched for teacher checkpoints; defaults to /kaggle/input")
     train_parser.add_argument("--calibrate", action="store_true", help="mark this run ineligible for submissions")
     smoke_parser = sub.add_parser("smoke", help="exercise available official images without making a submission")
     smoke_parser.add_argument("--config", type=Path)
     smoke_parser.add_argument("--data", type=Path)
     smoke_parser.add_argument("--out", type=Path, required=True)
     smoke_parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default="cpu")
+    smoke_parser.add_argument("--teachers", type=Path, help="directory searched for teacher checkpoints; defaults to /kaggle/input")
     predict_parser = sub.add_parser("predict", help="create a submission from a completed checkpoint")
     predict_parser.add_argument("--checkpoint", type=Path, required=True)
     predict_parser.add_argument("--data", type=Path)
@@ -772,20 +832,21 @@ def main(argv: list[str] | None = None) -> None:
     stage_parser.add_argument("--out", type=Path, required=True)
     stage_parser.add_argument("--mode", choices=("train", "smoke", "calibrate", "compare"), default="train")
     stage_parser.add_argument("--seed", type=int)
+    stage_parser.add_argument("--teachers-dataset", help="owner/slug of the private Kaggle dataset holding teacher checkpoints")
     args = parser.parse_args(argv)
     if args.command == "stage":
-        stage(args.config, args.run_id, args.out, args.mode, args.seed)
+        stage(args.config, args.run_id, args.out, args.mode, args.seed, args.teachers_dataset)
     elif args.command == "check":
         check_submission(args.submission, args.sample)
         print("submission matches sample IDs and order")
     elif args.command == "smoke":
-        smoke(find_data_root(args.data), args.out, device_for(args.device), config_from(args.config) if args.config else RunConfig())
+        smoke(find_data_root(args.data), args.out, device_for(args.device), config_from(args.config) if args.config else RunConfig(), args.teachers)
     elif args.command == "predict":
         predict(args.checkpoint, find_data_root(args.data), args.out, device_for(args.device))
     else:
         cfg = config_from(args.config)
         cfg = replace(cfg, epochs=args.epochs if args.epochs is not None else cfg.epochs, split=args.split if args.split else cfg.split)
-        train(cfg, find_data_root(args.data), args.out, device_for(args.device), args.max_seconds, "calibrate" if args.calibrate else "train")
+        train(cfg, find_data_root(args.data), args.out, device_for(args.device), args.max_seconds, "calibrate" if args.calibrate else "train", args.teachers)
 
 
 if __name__ == "__main__":

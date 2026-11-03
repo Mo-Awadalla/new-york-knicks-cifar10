@@ -1,0 +1,28 @@
+{
+  "arch": "wrn22_4",
+  "aug": "cutmix",
+  "epochs": 200,
+  "seed": 1,
+  "batch": 128,
+  "lr": 0.1,
+  "momentum": 0.9,
+  "wd": 0.0005,
+  "warmup": 5,
+  "kd_alpha": 0.9,
+  "kd_temperature": 4.0,
+  "split": "val",
+  "teachers": [
+    [
+      "sam22-45k.pt",
+      "2176ca67b10e1134cd5ad71c1971733372df737f9ebf791115adef8dbc0d1b60"
+    ],
+    [
+      "cutmix22-45k.pt",
+      "54fb79b6d9a9de97b70d7a53b6218b40cd4c5aeb69a951f2e7cdea4aea08205c"
+    ],
+    [
+      "cutout16-45k.pt",
+      "3a46d09b24f1b38bedd05d0aadc52e69e6cd558c58bd73b294a01751ce04845f"
+    ]
+  ]
+}
