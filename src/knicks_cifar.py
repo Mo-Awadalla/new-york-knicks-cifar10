@@ -746,13 +746,25 @@ def stage(config_path: Path, run_id: str, out: Path, mode: str, seed: int | None
     if bool(cfg.teachers) != (teachers_dataset is not None) or (teachers_dataset is not None and not re.fullmatch(r"[a-z0-9-]+/[a-z0-9-]+", teachers_dataset)):
         raise ValueError("distillation configs require exactly one owner/slug teacher dataset; other configs take none")
     out.mkdir(parents=True, exist_ok=False)
-    slug = f"knicks-{run_id}"
+    write_kernel(out, f"knicks-{run_id}", {"mode": mode, "config": asdict(cfg)}, [teachers_dataset] if teachers_dataset else [], gpu=True)
+
+
+def stage_predict(run_id: str, out: Path, dataset: str, checkpoint_name: str, checkpoint_sha256: str) -> None:
+    """Stage a CPU kernel that turns a checkpoint trained elsewhere into a validated submission CSV."""
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", run_id) or len(run_id) > 42:
+        raise ValueError("run-id must be lowercase alphanumeric words separated by hyphens, at most 42 characters")
+    if not re.fullmatch(r"[a-z0-9-]+/[a-z0-9-]+", dataset) or not re.fullmatch(r"[A-Za-z0-9._-]+\.pt", checkpoint_name) or not re.fullmatch(r"[0-9a-f]{64}", checkpoint_sha256):
+        raise ValueError("predict staging requires an owner/slug dataset, a .pt file name, and its sha256")
+    out.mkdir(parents=True, exist_ok=False)
+    write_kernel(out, f"knicks-{run_id}", {"mode": "predict", "checkpoint": checkpoint_name, "checkpoint_sha256": checkpoint_sha256}, [dataset], gpu=False)
+
+
+def write_kernel(out: Path, slug: str, spec: dict, dataset_sources: list[str], gpu: bool) -> None:
     source_hashes()
     source_dir = Path(__file__).resolve().parent
     sources = {name: (source_dir / name).read_bytes() for name in SOURCE_MODULES}
     hashes = {name: hashlib.sha256(data).hexdigest() for name, data in sources.items()}
-    digest = source_digest(hashes)
-    spec = {"slug": slug, "mode": mode, "config": asdict(cfg), "source_sha256": digest}
+    spec = {"slug": slug, **spec, "source_sha256": source_digest(hashes)}
     staged = (
         "import sys\n"
         "import tempfile\n"
@@ -767,19 +779,34 @@ def stage(config_path: Path, run_id: str, out: Path, mode: str, seed: int | None
         "    knicks_cifar.run_kernel(SPEC, sys.argv[1:])\n"
     )
     (out / "kernel.py").write_text(staged)
-    json_write(out / "kernel-metadata.json", {"id": f"moawadalla/{slug}", "title": slug, "code_file": "kernel.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": False, "dataset_sources": [teachers_dataset] if teachers_dataset else [], "competition_sources": ["cifar-10-res-net-architecture-challenge-dl"], "kernel_sources": []})
+    json_write(out / "kernel-metadata.json", {"id": f"moawadalla/{slug}", "title": slug, "code_file": "kernel.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": gpu, "enable_internet": False, "dataset_sources": dataset_sources, "competition_sources": ["cifar-10-res-net-architecture-challenge-dl"], "kernel_sources": []})
 
 
 def run_kernel(spec: dict, argv: list[str]) -> None:
     parser = argparse.ArgumentParser(description="Run a staged CIFAR experiment")
     parser.add_argument("--working", type=Path, default=Path("/kaggle/working"))
     parser.add_argument("--data", type=Path)
-    parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default="cuda")
+    parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default="cuda" if spec["mode"] != "predict" else "cpu")
     parser.add_argument("--teachers", type=Path, help="directory searched for teacher checkpoints; defaults to /kaggle/input")
+    parser.add_argument("--inputs", type=Path, default=Path("/kaggle/input"), help="directory searched for a predict-mode checkpoint")
     args = parser.parse_args(argv)
     if source_sha256() != spec["source_sha256"]:
         raise RuntimeError("staged source hash mismatch")
     args.working.mkdir(parents=True, exist_ok=True)
+    if spec["mode"] == "predict":
+        # The dataset holds NAME.pt beside NAME.manifest.json; predict expects checkpoint.pt beside manifest.json.
+        matches = sorted(args.inputs.resolve().rglob(spec["checkpoint"]))
+        if len(matches) != 1 or sha256_file(matches[0]) != spec["checkpoint_sha256"]:
+            raise ValueError(f"expected one {spec['checkpoint']} with the staged sha256 under {args.inputs}")
+        staged_dir = args.working / f"{spec['slug']}-checkpoint"
+        staged_dir.mkdir()
+        (staged_dir / "checkpoint.pt").write_bytes(matches[0].read_bytes())
+        (staged_dir / "manifest.json").write_bytes(matches[0].with_name(matches[0].stem + ".manifest.json").read_bytes())
+        prediction = ["predict", "--checkpoint", str(staged_dir / "checkpoint.pt"), "--out", str(args.working / "submission.csv"), "--device", args.device]
+        if args.data is not None:
+            prediction += ["--data", str(args.data)]
+        main(prediction)
+        return
     config_path = args.working / f"{spec['slug']}-config.json"
     output_path = args.working / f"{spec['slug']}-output"
     with config_path.open("x") as config_file:
@@ -837,9 +864,16 @@ def main(argv: list[str] | None = None) -> None:
     stage_parser.add_argument("--mode", choices=("train", "smoke", "calibrate", "compare"), default="train")
     stage_parser.add_argument("--seed", type=int)
     stage_parser.add_argument("--teachers-dataset", help="owner/slug of the private Kaggle dataset holding teacher checkpoints")
+    stage_predict_parser = sub.add_parser("stage-predict", help="write a CPU Kaggle script that predicts from a checkpoint in a private dataset")
+    stage_predict_parser.add_argument("--run-id", required=True)
+    stage_predict_parser.add_argument("--out", type=Path, required=True)
+    stage_predict_parser.add_argument("--dataset", required=True, help="owner/slug holding NAME.pt and NAME.manifest.json")
+    stage_predict_parser.add_argument("--checkpoint", type=Path, required=True, help="local copy of NAME.pt; its name and sha256 are pinned")
     args = parser.parse_args(argv)
     if args.command == "stage":
         stage(args.config, args.run_id, args.out, args.mode, args.seed, args.teachers_dataset)
+    elif args.command == "stage-predict":
+        stage_predict(args.run_id, args.out, args.dataset, args.checkpoint.name, sha256_file(args.checkpoint))
     elif args.command == "check":
         check_submission(args.submission, args.sample)
         print("submission matches sample IDs and order")

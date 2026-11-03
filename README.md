@@ -153,6 +153,25 @@ uv run python src/knicks_cifar.py stage --config configs/kd-cutmix22-full.json \
   --teachers-dataset moawadalla/knicks-kd-teachers-001
 ```
 
+## Train large teachers on NYU HPC cloud bursting
+
+Course work runs on HPC Cloud Bursting through Open OnDemand (`ood.burst.hpc.nyu.edu`, Slurm account `cs_gy_6923-2026fa`), not the Torch cluster. A JupyterLab session on `c24m170-a100-2` provides two A100 40 GB GPUs; its terminal runs the scripts in `hpc/` under `/scratch/$USER/knicks`.
+
+- `hpc/setup.sh` checks the private training export's archive hash and all 50,000 image hashes, and builds the Kaggle-matched environment (PyTorch 2.11.0+cu128, torchvision 0.26.0, NumPy 2.1.3, Pillow 13.0.0). No evaluation images are transferred.
+- `hpc/teachers.sh` trains six teacher-only WRN-28-10 models (36,479,194 parameters): CutMix, SAM with Cutout, and Cutout, each on the 45,000-row split and on all 50,000 rows. `wrn28_10` exceeds the 5,000,000 cap, so its checkpoints are never submission-eligible and `predict` refuses them.
+- `hpc/ensemble_eval.py` reports single and soft-ensemble validation accuracy for 45,000-row teachers, so the teacher set is chosen on validation.
+- `hpc/students.sh SET STEM...` distills WRN-22-4 CutMix students from `teachers/STEM-45k.pt` (validation) and `teachers/STEM-full.pt` (submission) at 200 and 400 epochs, one horizon per GPU.
+
+Full-data students are scored on Kaggle, where the test images live. Upload `NAME.pt` with its run manifest as `NAME.manifest.json` to a private dataset, then stage a CPU kernel that pins the checkpoint hash:
+
+```bash
+uv run python src/knicks_cifar.py stage-predict --run-id predict-NAME --out runs/predict-NAME/kernel \
+  --dataset moawadalla/DATASET --checkpoint PATH/NAME.pt
+kaggle kernels push -p runs/predict-NAME/kernel
+```
+
+Use a kernel run ID that differs from the dataset slug; Kaggle rejects a kernel whose slug matches an existing dataset. A parity run on the full-data distilled student reproduced its GPU-generated `submission.csv` byte for byte.
+
 
 ## Project folders
 
