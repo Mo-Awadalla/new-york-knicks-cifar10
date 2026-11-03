@@ -90,7 +90,7 @@ The repository needs model implementation, preprocessing and augmentation, train
 
 - Brightspace report assignment timezone and upload destination.
 
-Six scored submissions reached 30.20%, 84.90%, 86.30%, 87.10%, 87.90%, and 87.40%. The 87.90% entry is WRN-22-4 CutMix and the 87.40% entry is WRN-22-4 SAM with Cutout, each trained for 200 epochs from scratch on all 50,000 permitted images with seed 1. Neither recipe cleared the locked validation gate; the user directed both retrains after the AugMix screen finished at 4,788 of 5,000. Full-data models have no held-out validation score.
+Seven scored submissions reached 30.20%, 84.90%, 86.30%, 87.10%, 87.90%, 87.40%, and 87.50%. The 87.90% entry is WRN-22-4 CutMix and the 87.40% entry is WRN-22-4 SAM with Cutout, each trained for 200 epochs from scratch on all 50,000 permitted images with seed 1. Neither recipe cleared the locked validation gate; the user directed both retrains after the AugMix screen finished at 4,788 of 5,000. The 87.50% entry is a WRN-22-4 CutMix student distilled from those full-data SAM and CutMix models plus the full-data WRN-16-4 Cutout model. Its 45,000-row version, distilled only from 45,000-row teachers, reached 4,866 of 5,000 validation images, 29 above the matching CutMix run and 43 above the fresh control. Full-data models have no held-out validation score.
 
 The user selected the corrected validation-led AugMix-JSD, SAM-Cutout, and CutMix-only portfolio on WRN-22-4. These methods and the single-seed selector have 43 local tests passing. All three methods completed their three-epoch Kaggle GPU calibrations with 1,056 optimizer updates each and zero skipped updates. These are calibration results, not competitive accuracy results.
 
