@@ -1,4 +1,5 @@
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -74,6 +75,18 @@ class DistillationTest(unittest.TestCase):
                 kc.RunConfig(teachers=teachers, **change).validate()
         with self.assertRaises(ValueError):
             kc.RunConfig(kd_temperature=2.0).validate()
+
+    def test_teacher_architecture_cannot_create_submission(self):
+        cfg = kc.RunConfig(arch="wrn28_10", aug="cutmix", split="all")
+        cfg.validate()
+        self.assertGreater(kc.ARCHS["wrn28_10"][2], kc.MAX_PARAMS)
+        with tempfile.TemporaryDirectory() as directory, patch.object(kc, "build", side_effect=lambda arch: RecordingModel(0)):
+            path = Path(directory) / "checkpoint.pt"
+            checkpoint = kc.make_checkpoint(cfg, RecordingModel(0), torch.zeros(3), torch.ones(3), kc.Split((0,), (), "s"), {}, "train", cfg.epochs)
+            torch.save(checkpoint, path)
+            (path.parent / "manifest.json").write_text(json.dumps({"status": "complete", "checkpoint_sha256": kc.sha256_file(path)}))
+            with self.assertRaisesRegex(ValueError, "teacher-only"):
+                kc.predict(path, ROOT / "data", path.parent / "submission.csv", torch.device("cpu"))
 
 
 if __name__ == "__main__":

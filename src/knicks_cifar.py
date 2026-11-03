@@ -28,7 +28,9 @@ import knicks_methods
 from knicks_methods import OPTIMIZERS, POLICIES, Distillation, Rngs, Teacher, TrainingMethod, augment, method_record, normalize
 
 
-ARCHS = {"wrn16_4": (16, 2_748_890), "wrn22_4": (22, 4_298_970)}
+ARCHS = {"wrn16_4": (16, 4, 2_748_890), "wrn22_4": (22, 4, 4_298_970), "wrn28_10": (28, 10, 36_479_194)}
+# Teacher-only architectures exceed the submission cap; they may only supervise distillation.
+TEACHER_ARCHS = frozenset({"wrn28_10"})
 MAX_PARAMS = 5_000_000
 DEFAULT_DEADLINE = 7 * 60 * 60
 SOURCE_MODULES = ("knicks_cifar.py", "knicks_methods.py")
@@ -258,19 +260,19 @@ class Block(nn.Module):
 
 
 class WideResNet(nn.Module):
-    def __init__(self, depth: int):
+    def __init__(self, depth: int, width: int = 4):
         super().__init__()
         self.stem = nn.Conv2d(3, 16, 3, 1, 1, bias=False)
         layers = []
         incoming = 16
-        for group, outgoing in enumerate((64, 128, 256)):
+        for group, outgoing in enumerate((16 * width, 32 * width, 64 * width)):
             for block in range((depth - 4) // 6):
                 stride = 2 if group > 0 and block == 0 else 1
                 layers.append(Block(incoming, outgoing, stride))
                 incoming = outgoing
         self.blocks = nn.Sequential(*layers)
-        self.bn = nn.BatchNorm2d(256)
-        self.head = nn.Linear(256, 10)
+        self.bn = nn.BatchNorm2d(incoming)
+        self.head = nn.Linear(incoming, 10)
         for module in self.modules():
             if isinstance(module, nn.Conv2d):
                 nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
@@ -290,10 +292,10 @@ def trainable_params(model: nn.Module) -> int:
 def build(arch: str) -> nn.Module:
     if arch not in ARCHS:
         raise ValueError(f"unknown architecture: {arch}")
-    depth, expected = ARCHS[arch]
-    model = WideResNet(depth)
+    depth, width, expected = ARCHS[arch]
+    model = WideResNet(depth, width)
     count = trainable_params(model)
-    if count != expected or count > MAX_PARAMS:
+    if count != expected or (count > MAX_PARAMS and arch not in TEACHER_ARCHS):
         raise ValueError(f"invalid trainable parameter count {count}, expected {expected}, cap {MAX_PARAMS}")
     return model
 
@@ -608,7 +610,7 @@ def train(cfg: RunConfig, root: Path, out: Path, device: torch.device, max_secon
             status.update({"final_val_correct": val_correct, "final_val_loss": val_loss, "final_val_accuracy": val_correct / len(split.val_rows)})
         if time.monotonic() >= deadline:
             raise TimeoutError("deadline expired after checkpoint validation")
-        status.update({"status": "complete", "checkpoint_sha256": sha256_file(checkpoint_path), "params": trainable_params(final_model), "mean": mean.cpu().tolist(), "std": std.cpu().tolist(), "candidate_eligible": kind == "train"})
+        status.update({"status": "complete", "checkpoint_sha256": sha256_file(checkpoint_path), "params": trainable_params(final_model), "mean": mean.cpu().tolist(), "std": std.cpu().tolist(), "candidate_eligible": kind == "train" and cfg.arch not in TEACHER_ARCHS})
     except BaseException as exc:
         status["error"] = f"{type(exc).__name__}: {exc}"
         raise
@@ -645,6 +647,8 @@ def predict(checkpoint_path: Path, root: Path, out: Path, device: torch.device) 
     if not run_manifest_path.is_file():
         raise ValueError("checkpoint requires its completed run manifest")
     run_manifest = json.loads(run_manifest_path.read_text())
+    if cfg.arch in TEACHER_ARCHS or checkpoint["params"] > MAX_PARAMS:
+        raise ValueError("teacher-only architectures exceed the parameter cap and cannot create a submission")
     if checkpoint["kind"] != "train" or checkpoint["completed_epochs"] != cfg.epochs or run_manifest.get("status") != "complete" or run_manifest.get("checkpoint_sha256") != sha256_file(checkpoint_path):
         raise ValueError("only a completed production training checkpoint can create a submission")
     train_manifest, test, sample = official_manifests(root)
