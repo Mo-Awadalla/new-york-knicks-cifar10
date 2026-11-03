@@ -1,0 +1,12 @@
+{
+  "arch": "wrn22_4",
+  "aug": "augmix_jsd",
+  "split": "val",
+  "epochs": 200,
+  "seed": 1,
+  "batch": 128,
+  "lr": 0.1,
+  "momentum": 0.9,
+  "wd": 0.0005,
+  "warmup": 5
+}

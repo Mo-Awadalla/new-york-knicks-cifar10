@@ -1,0 +1,12 @@
+{
+  "arch": "wrn16_4",
+  "aug": "randaugment_cutout",
+  "split": "val",
+  "epochs": 200,
+  "seed": 0,
+  "batch": 128,
+  "lr": 0.1,
+  "momentum": 0.9,
+  "wd": 0.0005,
+  "warmup": 5
+}

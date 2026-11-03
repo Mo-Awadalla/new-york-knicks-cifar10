@@ -1,0 +1,17 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+kaggle.json
+credentials.json
+access_token
+data/
+runs/
+submissions/*.csv
+*.pt
+*.pth
+*.ckpt
+.omp/
+*.egg-info/
