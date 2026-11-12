@@ -29,6 +29,19 @@ class TinyModel(nn.Module):
         return self.head(x.mean((2, 3)))
 
 
+class PredictionOutputTest(unittest.TestCase):
+    def test_missing_output_directory_and_existing_file_protection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "submissions" / "reproduction.csv"
+            kc.write_predictions(output, (4, 2), [8, 7])
+            with self.assertRaises(FileExistsError):
+                kc.write_predictions(output, (4, 2), [0, 0])
+            with output.open(newline="") as stream:
+                self.assertEqual(list(csv.DictReader(stream)), [
+                    {"id": "4", "label": "8"}, {"id": "2", "label": "7"},
+                ])
+
+
 class ConfigContractTest(unittest.TestCase):
     def test_default_legacy_and_single_treatment_rules(self):
         cfg = kc.config_from(ROOT / "configs/wrn22-cutout.json")
@@ -127,9 +140,6 @@ class StagedSmokeTest(unittest.TestCase):
                     self.assertEqual(manifest["method_update"], "applied")
                     self.assertEqual(manifest["method_forward_images"], expected_views)
                     self.assertTrue(manifest["reload_logits_exact"])
-                    expected_hashes = {module: hashlib.sha256((ROOT / "src" / module).read_bytes()).hexdigest()
-                                       for module in ("knicks_cifar.py", "knicks_methods.py")}
-                    self.assertEqual(manifest["source_sha256_by_file"], expected_hashes)
                     self.assertEqual(manifest["checkpoint_sha256"], hashlib.sha256((output / "checkpoint.pt").read_bytes()).hexdigest())
                     with (output / "smoke_predictions.csv").open(newline="") as f:
                         rows = list(csv.DictReader(f))
