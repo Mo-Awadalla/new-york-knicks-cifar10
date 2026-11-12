@@ -6,7 +6,7 @@ Mohamed Awadalla is competing solo as **The New York Knicks** in NYU Tandon Deep
 
 - **Competition closes November 6, 2026 at 11:59 p.m. Eastern**, as displayed by Kaggle.
 
-- **Report due November 9, 2026 before 11:59 p.m.**, according to the Fall 2026 course PDF. The PDF does not state a timezone; confirm the Brightspace assignment timezone.
+- **Report due November 11, 2026, at 11:59 p.m.**, as displayed by Brightspace. The account's time zone is United States - New York, GMT-5. This supersedes the original November 9 date in the course PDF.
 
 - Use **The New York Knicks** consistently on Kaggle, the staff Google registration form, and the report.
 

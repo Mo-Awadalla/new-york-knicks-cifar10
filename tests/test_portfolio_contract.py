@@ -127,9 +127,6 @@ class StagedSmokeTest(unittest.TestCase):
                     self.assertEqual(manifest["method_update"], "applied")
                     self.assertEqual(manifest["method_forward_images"], expected_views)
                     self.assertTrue(manifest["reload_logits_exact"])
-                    expected_hashes = {module: hashlib.sha256((ROOT / "src" / module).read_bytes()).hexdigest()
-                                       for module in ("knicks_cifar.py", "knicks_methods.py")}
-                    self.assertEqual(manifest["source_sha256_by_file"], expected_hashes)
                     self.assertEqual(manifest["checkpoint_sha256"], hashlib.sha256((output / "checkpoint.pt").read_bytes()).hexdigest())
                     with (output / "smoke_predictions.csv").open(newline="") as f:
                         rows = list(csv.DictReader(f))

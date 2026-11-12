@@ -1,0 +1,26 @@
+{
+  "arch": "wrn16_5",
+  "aug": "cutmix",
+  "batch": 128,
+  "epochs": 200,
+  "kd_alpha": 0.9,
+  "kd_temperature": 4.0,
+  "lr": 0.1,
+  "momentum": 0.9,
+  "optimizer": "sgd",
+  "seed": 1,
+  "split": "all",
+  "strategy": "cosine",
+  "teachers": [
+    [
+      "wrn28-cutmix-full.pt",
+      "1230772affb5fbaa87406193b00ee766dcc57b57d03e4380d96443f43037c041"
+    ],
+    [
+      "wrn28-samcutout-full.pt",
+      "dbcb738f99f2f91a46921d271b773d6c8d991ab2ccc8043a9005405f4a6612e3"
+    ]
+  ],
+  "warmup": 5,
+  "wd": 0.0005
+}

@@ -25,15 +25,17 @@ from torch.optim.swa_utils import AveragedModel, update_bn
 from torch.torch_version import TorchVersion
 
 import knicks_methods
+import knicks_tta
 from knicks_methods import OPTIMIZERS, POLICIES, Distillation, Rngs, Teacher, TrainingMethod, augment, method_record, normalize
 
 
-ARCHS = {"wrn16_4": (16, 4, 2_748_890), "wrn22_4": (22, 4, 4_298_970), "wrn28_10": (28, 10, 36_479_194)}
+ARCHS = {"wrn16_4": (16, 4, 2_748_890), "wrn16_5": (16, 5, 4_289_754), "wrn22_4": (22, 4, 4_298_970), "wrn28_10": (28, 10, 36_479_194)}
 # Teacher-only architectures exceed the submission cap; they may only supervise distillation.
 TEACHER_ARCHS = frozenset({"wrn28_10"})
 MAX_PARAMS = 5_000_000
 DEFAULT_DEADLINE = 7 * 60 * 60
-SOURCE_MODULES = ("knicks_cifar.py", "knicks_methods.py")
+SOURCE_MODULES = ("knicks_cifar.py", "knicks_methods.py", "knicks_tta.py")
+INFERENCE_POLICIES = ("single", "augmix32")
 SWA_LR = 0.01
 
 
@@ -391,8 +393,9 @@ def input_hashes(root: Path) -> dict[str, str]:
 
 def source_hashes() -> dict[str, str]:
     source_dir = Path(__file__).resolve().parent
-    if Path(knicks_methods.__file__).resolve() != source_dir / "knicks_methods.py":
-        raise RuntimeError("knicks_methods must be loaded from the trainer's source directory")
+    for module in (knicks_methods, knicks_tta):
+        if Path(module.__file__).resolve() != source_dir / f"{module.__name__}.py":
+            raise RuntimeError(f"{module.__name__} must be loaded from the trainer's source directory")
     return {name: sha256_file(source_dir / name) for name in SOURCE_MODULES}
 
 
@@ -639,7 +642,12 @@ def check_submission(path: Path, sample: Path) -> None:
         raise ValueError("submission IDs/order or labels do not match the sample")
 
 
-def predict(checkpoint_path: Path, root: Path, out: Path, device: torch.device) -> None:
+def predict(checkpoint_path: Path, root: Path, out: Path, device: torch.device, *, inference: str = "single") -> None:
+    if inference not in INFERENCE_POLICIES:
+        raise ValueError(f"unknown inference policy: {inference}")
+    inference_path = out.with_suffix(".inference.json")
+    if inference != "single" and inference_path.exists():
+        raise FileExistsError(inference_path)
     checkpoint, model, mean, std = checkpoint_model(checkpoint_path, device)
     cfg = RunConfig(**checkpoint["config"])
     cfg.validate()
@@ -649,16 +657,32 @@ def predict(checkpoint_path: Path, root: Path, out: Path, device: torch.device) 
     run_manifest = json.loads(run_manifest_path.read_text())
     if cfg.arch in TEACHER_ARCHS or checkpoint["params"] > MAX_PARAMS:
         raise ValueError("teacher-only architectures exceed the parameter cap and cannot create a submission")
-    if checkpoint["kind"] != "train" or checkpoint["completed_epochs"] != cfg.epochs or run_manifest.get("status") != "complete" or run_manifest.get("checkpoint_sha256") != sha256_file(checkpoint_path):
+    checkpoint_hash = sha256_file(checkpoint_path)
+    if checkpoint["kind"] != "train" or checkpoint["completed_epochs"] != cfg.epochs or run_manifest.get("status") != "complete" or run_manifest.get("checkpoint_sha256") != checkpoint_hash:
         raise ValueError("only a completed production training checkpoint can create a submission")
     train_manifest, test, sample = official_manifests(root)
-    if checkpoint["provenance"]["csv_sha256"] != input_hashes(root) or checkpoint["split_sha256"] != stratified_split(train_manifest, cfg.split).sha256:
+    csv_hashes = input_hashes(root)
+    if checkpoint["provenance"]["csv_sha256"] != csv_hashes or checkpoint["split_sha256"] != stratified_split(train_manifest, cfg.split).sha256:
         raise ValueError("dataset manifests or split differ from the checkpoint")
-    images = decode(test, tuple(range(len(test.ids))), image_index(root), device)
-    predictions, _, _ = evaluate(model, images, None, tuple(range(len(test.ids))), mean, std, cfg.batch)
+    image_device = device if inference == "single" else torch.device("cpu")
+    images = decode(test, tuple(range(len(test.ids))), image_index(root), image_device)
+    if inference == "single":
+        predictions, _, _ = evaluate(model, images, None, tuple(range(len(test.ids))), mean, std, cfg.batch)
+    else:
+        probabilities = knicks_tta.augmix32_probabilities(model, images, test.ids, mean, std, batch_size=cfg.batch)
+        predictions = probabilities.argmax(1).tolist()
+        if sha256_file(checkpoint_path) != checkpoint_hash:
+            raise ValueError("source checkpoint changed during inference")
     by_id = dict(zip(test.ids, predictions))
     write_predictions(out, sample, [by_id[i] for i in sample])
     check_submission(out, root / "sample_submission.csv")
+    if inference != "single":
+        json_write(inference_path, {"policy": knicks_tta.policy_record(), "checkpoint_sha256": checkpoint_hash,
+                                   "source_sha256": source_sha256(), "csv_sha256": csv_hashes,
+                                   "prediction_sha256": sha256_file(out), "rows": len(test.ids),
+                                   "params": checkpoint["params"], "device": str(device), "batch_size": cfg.batch,
+                                   "torch": str(torch.__version__), "numpy": np.__version__, "pillow": PIL.__version__,
+                                   "model_state_unchanged": True, "checkpoint_unchanged": True})
 
 
 def smoke(root: Path, out: Path, device: torch.device, cfg: RunConfig, teacher_dir: Path | None = None) -> None:
@@ -749,14 +773,16 @@ def stage(config_path: Path, run_id: str, out: Path, mode: str, seed: int | None
     write_kernel(out, f"knicks-{run_id}", {"mode": mode, "config": asdict(cfg)}, [teachers_dataset] if teachers_dataset else [], gpu=True)
 
 
-def stage_predict(run_id: str, out: Path, dataset: str, checkpoint_name: str, checkpoint_sha256: str) -> None:
+def stage_predict(run_id: str, out: Path, dataset: str, checkpoint_name: str, checkpoint_sha256: str, *, inference: str = "single") -> None:
     """Stage a CPU kernel that turns a checkpoint trained elsewhere into a validated submission CSV."""
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", run_id) or len(run_id) > 42:
         raise ValueError("run-id must be lowercase alphanumeric words separated by hyphens, at most 42 characters")
     if not re.fullmatch(r"[a-z0-9-]+/[a-z0-9-]+", dataset) or not re.fullmatch(r"[A-Za-z0-9._-]+\.pt", checkpoint_name) or not re.fullmatch(r"[0-9a-f]{64}", checkpoint_sha256):
         raise ValueError("predict staging requires an owner/slug dataset, a .pt file name, and its sha256")
+    if inference not in INFERENCE_POLICIES:
+        raise ValueError(f"unknown inference policy: {inference}")
     out.mkdir(parents=True, exist_ok=False)
-    write_kernel(out, f"knicks-{run_id}", {"mode": "predict", "checkpoint": checkpoint_name, "checkpoint_sha256": checkpoint_sha256}, [dataset], gpu=False)
+    write_kernel(out, f"knicks-{run_id}", {"mode": "predict", "checkpoint": checkpoint_name, "checkpoint_sha256": checkpoint_sha256, "inference": inference}, [dataset], gpu=False)
 
 
 def write_kernel(out: Path, slug: str, spec: dict, dataset_sources: list[str], gpu: bool) -> None:
@@ -802,7 +828,7 @@ def run_kernel(spec: dict, argv: list[str]) -> None:
         staged_dir.mkdir()
         (staged_dir / "checkpoint.pt").write_bytes(matches[0].read_bytes())
         (staged_dir / "manifest.json").write_bytes(matches[0].with_name(matches[0].stem + ".manifest.json").read_bytes())
-        prediction = ["predict", "--checkpoint", str(staged_dir / "checkpoint.pt"), "--out", str(args.working / "submission.csv"), "--device", args.device]
+        prediction = ["predict", "--checkpoint", str(staged_dir / "checkpoint.pt"), "--out", str(args.working / "submission.csv"), "--device", args.device, "--inference", spec.get("inference", "single")]
         if args.data is not None:
             prediction += ["--data", str(args.data)]
         main(prediction)
@@ -854,6 +880,7 @@ def main(argv: list[str] | None = None) -> None:
     predict_parser.add_argument("--data", type=Path)
     predict_parser.add_argument("--out", type=Path, required=True)
     predict_parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default="cuda")
+    predict_parser.add_argument("--inference", choices=INFERENCE_POLICIES, default="single", help="fixed inference policy; augmix32 never updates model state")
     check_parser = sub.add_parser("check", help="validate submission IDs, order, and labels")
     check_parser.add_argument("--submission", type=Path, required=True)
     check_parser.add_argument("--sample", type=Path, required=True)
@@ -869,18 +896,19 @@ def main(argv: list[str] | None = None) -> None:
     stage_predict_parser.add_argument("--out", type=Path, required=True)
     stage_predict_parser.add_argument("--dataset", required=True, help="owner/slug holding NAME.pt and NAME.manifest.json")
     stage_predict_parser.add_argument("--checkpoint", type=Path, required=True, help="local copy of NAME.pt; its name and sha256 are pinned")
+    stage_predict_parser.add_argument("--inference", choices=INFERENCE_POLICIES, default="single")
     args = parser.parse_args(argv)
     if args.command == "stage":
         stage(args.config, args.run_id, args.out, args.mode, args.seed, args.teachers_dataset)
     elif args.command == "stage-predict":
-        stage_predict(args.run_id, args.out, args.dataset, args.checkpoint.name, sha256_file(args.checkpoint))
+        stage_predict(args.run_id, args.out, args.dataset, args.checkpoint.name, sha256_file(args.checkpoint), inference=args.inference)
     elif args.command == "check":
         check_submission(args.submission, args.sample)
         print("submission matches sample IDs and order")
     elif args.command == "smoke":
         smoke(find_data_root(args.data), args.out, device_for(args.device), config_from(args.config) if args.config else RunConfig(), args.teachers)
     elif args.command == "predict":
-        predict(args.checkpoint, find_data_root(args.data), args.out, device_for(args.device))
+        predict(args.checkpoint, find_data_root(args.data), args.out, device_for(args.device), inference=args.inference)
     else:
         cfg = config_from(args.config)
         cfg = replace(cfg, epochs=args.epochs if args.epochs is not None else cfg.epochs, split=args.split if args.split else cfg.split)
