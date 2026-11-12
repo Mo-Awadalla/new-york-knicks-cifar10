@@ -29,6 +29,19 @@ class TinyModel(nn.Module):
         return self.head(x.mean((2, 3)))
 
 
+class PredictionOutputTest(unittest.TestCase):
+    def test_missing_output_directory_and_existing_file_protection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "submissions" / "reproduction.csv"
+            kc.write_predictions(output, (4, 2), [8, 7])
+            with self.assertRaises(FileExistsError):
+                kc.write_predictions(output, (4, 2), [0, 0])
+            with output.open(newline="") as stream:
+                self.assertEqual(list(csv.DictReader(stream)), [
+                    {"id": "4", "label": "8"}, {"id": "2", "label": "7"},
+                ])
+
+
 class ConfigContractTest(unittest.TestCase):
     def test_default_legacy_and_single_treatment_rules(self):
         cfg = kc.config_from(ROOT / "configs/wrn22-cutout.json")

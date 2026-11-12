@@ -628,6 +628,7 @@ def train(cfg: RunConfig, root: Path, out: Path, device: torch.device, max_secon
 def write_predictions(path: Path, ids: tuple[int, ...], predictions: list[int]) -> None:
     if len(ids) != len(predictions):
         raise ValueError("prediction count mismatch")
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["id", "label"])

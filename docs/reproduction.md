@@ -108,6 +108,8 @@ Two training-only teachers each have 36,479,194 parameters. Only the 4,298,970-p
 
 The final checkpoint SHA-256 is `9a5a28fa5e00dc4e929d5f0b25f7c3bd14a5123c43d6cb6409407be039460a49`. Place its matching manifest beside it as `manifest.json`.
 
+Prediction creates missing output directories and refuses to overwrite an existing CSV.
+
 ```bash
 uv run python src/knicks_cifar.py predict \
   --checkpoint FINAL_RUN/checkpoint.pt --data data \
